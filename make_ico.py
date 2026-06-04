@@ -18,4 +18,4 @@ if __name__ == "__main__":
     base = make(256)
     base.save("app.ico", sizes=[(16, 16), (24, 24), (32, 32),
                                 (48, 48), (64, 64), (128, 128), (256, 256)])
-    print("app.ico 생성 완료")
+    print("app.ico created")
