@@ -62,6 +62,7 @@ DEFAULT_CONFIG = {
     "cd_minutes": 0,
     "cd_target_ts": None,   # 카운트다운 목표 절대시각(epoch)
     "warn_seconds": 60,     # 재시작 전 경고(유예) 시간 — 이 동안 취소 가능
+    "silent": False,        # True면 경고/팝업 없이 즉시 재시작
     "enabled": False,
     "autostart": True,
 }
@@ -150,7 +151,7 @@ class App:
         # GUI
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("380x510")
+        self.root.geometry("380x545")
         self.root.resizable(False, False)
         self._build_gui()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)  # ✕ → 트레이로
@@ -183,6 +184,7 @@ class App:
         self.cdh_var = tk.StringVar(value=str(int(self.cfg["cd_hours"])))
         self.cdm_var = tk.StringVar(value=str(int(self.cfg["cd_minutes"])))
         self.warn_var = tk.StringVar(value=str(int(self.cfg["warn_seconds"])))
+        self.silent_var = tk.BooleanVar(value=self.cfg.get("silent", False))
         self.enabled_var = tk.BooleanVar(value=self.cfg["enabled"])
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         self.status_var = tk.StringVar(value="")
@@ -224,6 +226,8 @@ class App:
         ttk.Spinbox(r3, from_=0, to=600, width=5,
                     textvariable=self.warn_var).pack(side="left", padx=8)
         ttk.Label(r3, text="초").pack(side="left")
+        ttk.Checkbutton(f2, text="경고창 없이 조용히 즉시 재시작 (켜면 위 경고 시간 무시)",
+                        variable=self.silent_var).pack(anchor="w", padx=8, pady=2)
         ttk.Checkbutton(f2, text="활성화", variable=self.enabled_var).pack(
             anchor="w", padx=8, pady=2)
         ttk.Checkbutton(f2, text="부팅 시 자동 실행 (트레이 상주)",
@@ -304,13 +308,21 @@ class App:
 
     def _do_restart(self):
         warn = int(self.cfg["warn_seconds"])
+        silent = self.cfg.get("silent", False)
         self.pending = True
-        self.pending_until = time.time() + warn + 2
+        self.pending_until = time.time() + (0 if silent else warn) + 2
         try:
-            subprocess.run(
-                ["shutdown", "/r", "/t", str(warn),
-                 "/c", "예약된 자동 재시작이 실행됩니다."],
-                creationflags=CREATE_NO_WINDOW)
+            if silent:
+                # 경고/팝업 없이 즉시 강제 재시작
+                subprocess.run(["shutdown", "/r", "/t", "0", "/f"],
+                               creationflags=CREATE_NO_WINDOW)
+            elif warn <= 0:
+                subprocess.run(["shutdown", "/r", "/t", "0"],
+                               creationflags=CREATE_NO_WINDOW)
+            else:
+                subprocess.run(["shutdown", "/r", "/t", str(warn),
+                                "/c", "예약된 자동 재시작이 실행됩니다."],
+                               creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
 
@@ -338,6 +350,7 @@ class App:
 
         self.cfg["enabled"] = self.enabled_var.get()
         self.cfg["autostart"] = self.autostart_var.get()
+        self.cfg["silent"] = self.silent_var.get()
 
         # 매일 모드를 켜면 '부팅 시 자동 실행'이 있어야 매일 반복이 유지됨 → 자동 보장
         if self.cfg["mode"] == "daily" and self.cfg["enabled"]:
