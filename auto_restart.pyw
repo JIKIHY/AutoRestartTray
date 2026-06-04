@@ -3,9 +3,10 @@
 자동 재시작 트레이 프로그램 (Windows 포터블)
 
 기능
-  - 24시간 내 '지정 시각' 또는 '카운트다운'으로 PC 자동 재시작
+  - 24시간 내 '매일 지정 시각' 또는 '카운트다운'으로 PC 자동 재시작
+  - 예약 시각이 되면 열린 프로그램을 모두 무시하고 '강제로' 즉시 재시작 (경고 팝업 없음)
   - 창의 ✕(닫기)를 눌러도 종료되지 않고 트레이로 최소화되어 계속 동작
-  - 부팅 시 자동 실행되어 트레이에 상주 (HKCU\\...\\Run 등록)
+  - 부팅 시 자동 실행되어 트레이에 상주
 
 관리자 권한 불필요. 설정은 실행 파일과 같은 폴더의 config.json 에 저장됩니다.
 """
@@ -61,8 +62,6 @@ DEFAULT_CONFIG = {
     "cd_hours": 3,
     "cd_minutes": 0,
     "cd_target_ts": None,   # 카운트다운 목표 절대시각(epoch)
-    "warn_seconds": 60,     # 재시작 전 경고(유예) 시간 — 이 동안 취소 가능
-    "silent": False,        # True면 경고/팝업 없이 즉시 재시작
     "enabled": False,
     "autostart": True,
 }
@@ -124,7 +123,6 @@ def make_icon(active):
     d = ImageDraw.Draw(img)
     color = (33, 150, 243, 255) if active else (130, 130, 130, 255)  # 파랑/회색
     d.ellipse([3, 3, 61, 61], fill=color)
-    # 전원 심볼: 위가 트인 원호 + 세로선
     d.arc([20, 20, 44, 44], start=300, end=240, fill="white", width=5)
     d.line([32, 14, 32, 34], fill="white", width=5)
     return img
@@ -139,8 +137,6 @@ class App:
 
         # 내부 상태 (스레드 간 공유되는 평범한 속성)
         self.next_restart = None          # 다음 재시작 시각(datetime) 또는 None
-        self.pending = False              # OS 재시작 명령이 발행된 상태(경고중)
-        self.pending_until = 0
         self.start_time = time.time()     # 부팅 직후 우발적 재시작 방지용
         self.sched_running = True
         self._last_enabled = None
@@ -151,12 +147,12 @@ class App:
         # GUI
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("380x545")
+        self.root.geometry("380x430")
         self.root.resizable(False, False)
         self._build_gui()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)  # ✕ → 트레이로
 
-        # 트레이 아이콘 (별도 스레드에서 실행)
+        # 트레이 아이콘 (별도 스레드)
         self.icon = pystray.Icon(APP_NAME, make_icon(self.cfg["enabled"]),
                                  APP_TITLE, self._build_menu())
         threading.Thread(target=self.icon.run, daemon=True).start()
@@ -164,16 +160,13 @@ class App:
         # 스케줄러 스레드
         threading.Thread(target=self._scheduler, daemon=True).start()
 
-        # 부팅 자동 실행 동기화
         set_autostart(self.cfg["autostart"])
-
         self._recompute_next()
 
         # --tray 로 시작되면 창을 숨긴 채 트레이로만
         if "--tray" in sys.argv:
             self.root.withdraw()
 
-        # 메인 스레드 UI 갱신 루프 시작
         self._tick()
 
     # --- GUI 구성 ---------------------------------------------------------
@@ -183,9 +176,6 @@ class App:
         self.min_var = tk.StringVar(value=f'{int(self.cfg["minute"]):02d}')
         self.cdh_var = tk.StringVar(value=str(int(self.cfg["cd_hours"])))
         self.cdm_var = tk.StringVar(value=str(int(self.cfg["cd_minutes"])))
-        self.warn_var = tk.StringVar(value=str(int(self.cfg["warn_seconds"])))
-        self.silent_var = tk.BooleanVar(value=self.cfg.get("silent", False))
-        self.enabled_var = tk.BooleanVar(value=self.cfg["enabled"])
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         self.status_var = tk.StringVar(value="")
 
@@ -220,36 +210,26 @@ class App:
         # 옵션
         f2 = ttk.LabelFrame(self.root, text="옵션")
         f2.pack(fill="x", padx=12, pady=6)
-        r3 = ttk.Frame(f2)
-        r3.pack(fill="x", padx=8, pady=4)
-        ttk.Label(r3, text="경고(유예) 시간").pack(side="left")
-        ttk.Spinbox(r3, from_=0, to=600, width=5,
-                    textvariable=self.warn_var).pack(side="left", padx=8)
-        ttk.Label(r3, text="초").pack(side="left")
-        ttk.Checkbutton(f2, text="경고창 없이 조용히 즉시 재시작 (켜면 위 경고 시간 무시)",
-                        variable=self.silent_var).pack(anchor="w", padx=8, pady=2)
-        ttk.Checkbutton(f2, text="활성화", variable=self.enabled_var).pack(
-            anchor="w", padx=8, pady=2)
         ttk.Checkbutton(f2, text="부팅 시 자동 실행 (트레이 상주)",
-                        variable=self.autostart_var).pack(anchor="w", padx=8, pady=2)
+                        variable=self.autostart_var).pack(anchor="w", padx=8, pady=6)
 
         # 상태
         ttk.Label(self.root, textvariable=self.status_var, justify="left",
                   font=("Malgun Gothic", 10)).pack(fill="x", padx=14, pady=(8, 4))
 
-        # 버튼
+        # 버튼 (활성화 체크 없이 '예약 시작' 한 번이면 동작)
         b = ttk.Frame(self.root)
         b.pack(fill="x", padx=12, pady=(4, 4))
-        ttk.Button(b, text="적용", command=self.apply_settings).pack(
+        ttk.Button(b, text="예약 시작", command=self.apply_settings).pack(
             side="left", expand=True, fill="x", padx=2)
-        ttk.Button(b, text="재시작 취소", command=self.cancel_restart).pack(
+        ttk.Button(b, text="예약 중지", command=self.stop_schedule).pack(
             side="left", expand=True, fill="x", padx=2)
         ttk.Button(b, text="트레이로 최소화", command=self.hide_window).pack(
             side="left", expand=True, fill="x", padx=2)
 
         ttk.Label(self.root,
                   text="✕ 를 눌러도 트레이에서 계속 동작합니다.\n"
-                       "매일 모드는 한 번 적용하면 매일·재부팅 후에도 자동 반복됩니다.",
+                       "예약 시각이 되면 열린 프로그램을 모두 무시하고 강제 재시작합니다.",
                   foreground="#888", justify="center").pack(pady=(2, 10))
 
     # --- 트레이 메뉴 ------------------------------------------------------
@@ -259,19 +239,16 @@ class App:
             pystray.MenuItem(lambda item: self._status_line(),
                              lambda icon, item: None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("활성화", self._tray_toggle,
+            pystray.MenuItem("예약 켜기/끄기", self._tray_toggle,
                              checked=lambda item: self.cfg["enabled"]),
-            pystray.MenuItem("재시작 취소", self._tray_cancel),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("종료", self._tray_quit),
         )
 
     def _status_line(self):
-        if self.pending:
-            return "⚠ 곧 재시작 (취소 가능)"
         if self.cfg["enabled"] and self.next_restart:
             return "다음: " + self.next_restart.strftime("%m/%d %H:%M")
-        return "비활성화"
+        return "예약 없음"
 
     # --- 다음 재시작 시각 계산 (tk 호출 없음 → 어느 스레드에서나 안전) -----
     def _recompute_next(self):
@@ -291,14 +268,14 @@ class App:
                 self.next_restart = datetime.datetime.fromtimestamp(ts)
             else:
                 self.next_restart = None
-                self.cfg["enabled"] = False  # 만료/미설정이면 비활성
+                self.cfg["enabled"] = False
 
     # --- 스케줄러 스레드 ---------------------------------------------------
     def _scheduler(self):
         while self.sched_running:
             try:
-                # 부팅 직후 90초는 재시작을 보류 (재시작→부팅→즉시재시작 루프 방지)
-                if (self.cfg["enabled"] and self.next_restart and not self.pending
+                # 부팅 직후 90초는 보류 (재시작→부팅→즉시재시작 루프 방지)
+                if (self.cfg["enabled"] and self.next_restart
                         and time.time() - self.start_time > 90
                         and datetime.datetime.now() >= self.next_restart):
                     self._do_restart()
@@ -307,26 +284,13 @@ class App:
             time.sleep(1)
 
     def _do_restart(self):
-        warn = int(self.cfg["warn_seconds"])
-        silent = self.cfg.get("silent", False)
-        self.pending = True
-        self.pending_until = time.time() + (0 if silent else warn) + 2
+        # 무조건 강제 즉시 재시작 — 열린 프로그램/저장 안 된 파일 전부 무시
         try:
-            if silent:
-                # 경고/팝업 없이 즉시 강제 재시작
-                subprocess.run(["shutdown", "/r", "/t", "0", "/f"],
-                               creationflags=CREATE_NO_WINDOW)
-            elif warn <= 0:
-                subprocess.run(["shutdown", "/r", "/t", "0"],
-                               creationflags=CREATE_NO_WINDOW)
-            else:
-                subprocess.run(["shutdown", "/r", "/t", str(warn),
-                                "/c", "예약된 자동 재시작이 실행됩니다."],
-                               creationflags=CREATE_NO_WINDOW)
+            subprocess.run(["shutdown", "/r", "/t", "0", "/f"],
+                           creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
-
-        # 경고창 동안 재트리거되지 않도록 다음 일정 정리
+        # 재부팅 전 중복 트리거 방지
         if self.cfg["mode"] == "daily":
             self.next_restart = self.next_restart + datetime.timedelta(days=1)
         else:
@@ -343,23 +307,22 @@ class App:
             self.cfg["minute"] = max(0, min(59, int(self.min_var.get())))
             self.cfg["cd_hours"] = max(0, min(24, int(self.cdh_var.get())))
             self.cfg["cd_minutes"] = max(0, min(59, int(self.cdm_var.get())))
-            self.cfg["warn_seconds"] = max(0, min(600, int(self.warn_var.get())))
         except ValueError:
             messagebox.showerror(APP_TITLE, "숫자를 올바르게 입력하세요.")
             return
 
-        self.cfg["enabled"] = self.enabled_var.get()
+        # '예약 시작' = 곧바로 활성화 (활성화 체크 단계 없음)
+        self.cfg["enabled"] = True
         self.cfg["autostart"] = self.autostart_var.get()
-        self.cfg["silent"] = self.silent_var.get()
-
-        # 매일 모드를 켜면 '부팅 시 자동 실행'이 있어야 매일 반복이 유지됨 → 자동 보장
-        if self.cfg["mode"] == "daily" and self.cfg["enabled"]:
+        if self.cfg["mode"] == "daily":
+            # 매일 반복은 부팅 자동실행이 있어야 유지됨 → 자동 보장
             self.cfg["autostart"] = True
             self.autostart_var.set(True)
 
-        if self.cfg["mode"] == "countdown" and self.cfg["enabled"]:
+        if self.cfg["mode"] == "countdown":
             dur = self.cfg["cd_hours"] * 3600 + self.cfg["cd_minutes"] * 60
             if dur <= 0:
+                self.cfg["enabled"] = False
                 messagebox.showerror(APP_TITLE, "카운트다운 시간을 설정하세요.")
                 return
             self.cfg["cd_target_ts"] = time.time() + dur
@@ -368,21 +331,19 @@ class App:
         save_config(self.cfg)
         self._recompute_next()
 
-        if self.cfg["mode"] == "daily" and self.cfg["enabled"]:
+        if self.cfg["mode"] == "daily":
             msg = (f"매일 {self.cfg['hour']:02d}:{self.cfg['minute']:02d} 에 자동 재시작됩니다.\n"
-                   "한 번 설정하면 재부팅 후에도 그대로 유지되어\n"
-                   "다시 설정할 필요가 없습니다.")
+                   "재부팅 후에도 유지되며, 시각이 되면 강제로 재시작합니다.")
         else:
-            msg = "설정이 적용되었습니다."
+            msg = f"{self.cfg['cd_hours']}시간 {self.cfg['cd_minutes']}분 후 강제 재시작됩니다."
         messagebox.showinfo(APP_TITLE, msg)
 
-    def cancel_restart(self):
-        """예약된 OS 재시작을 취소(shutdown /a)."""
-        try:
-            subprocess.run(["shutdown", "/a"], creationflags=CREATE_NO_WINDOW)
-        except Exception:
-            pass
-        self.pending = False
+    def stop_schedule(self):
+        self.cfg["enabled"] = False
+        self.cfg["cd_target_ts"] = None
+        save_config(self.cfg)
+        self._recompute_next()
+        messagebox.showinfo(APP_TITLE, "자동 재시작 예약을 중지했습니다.")
 
     # --- 트레이 콜백 (tk 직접 호출 금지 → 플래그/평범한 상태만 변경) -------
     def _tray_show(self, icon=None, item=None):
@@ -390,9 +351,6 @@ class App:
 
     def _tray_quit(self, icon=None, item=None):
         self._quit_request = True
-
-    def _tray_cancel(self, icon=None, item=None):
-        self.cancel_restart()
 
     def _tray_toggle(self, icon, item):
         self.cfg["enabled"] = not self.cfg["enabled"]
@@ -438,7 +396,6 @@ class App:
 
     # --- 메인 스레드 UI 갱신 루프 -----------------------------------------
     def _tick(self):
-        # 트레이에서 온 요청 처리 (tk 조작은 반드시 메인 스레드에서)
         if self._show_request:
             self._show_request = False
             self._show_window()
@@ -447,14 +404,8 @@ class App:
             self._do_quit()
             return
 
-        # 경고(pending) 만료 처리
-        if self.pending and time.time() > self.pending_until:
-            self.pending = False
-
-        # 활성 상태 변화 → 아이콘/메뉴/체크박스 동기화
         if self._last_enabled != self.cfg["enabled"]:
             self._last_enabled = self.cfg["enabled"]
-            self.enabled_var.set(self.cfg["enabled"])
             self._update_icon()
             try:
                 self.icon.update_menu()
@@ -465,9 +416,6 @@ class App:
         self.root.after(1000, self._tick)
 
     def _refresh_status(self):
-        if self.pending:
-            self.status_var.set("⚠ 곧 재시작합니다 (재시작 취소 가능)")
-            return
         if self.cfg["enabled"] and self.next_restart:
             remaining = int((self.next_restart - datetime.datetime.now()).total_seconds())
             remaining = max(0, remaining)
@@ -478,7 +426,7 @@ class App:
                 head = "다음 재시작: " + self.next_restart.strftime("%m/%d %H:%M")
             self.status_var.set(f"{head}\n남은 시간: {h:02d}:{m:02d}:{s:02d}")
         else:
-            self.status_var.set("비활성화 상태입니다.")
+            self.status_var.set("예약 없음 — 시각을 정하고 '예약 시작'을 누르세요.")
 
     def run(self):
         self.root.mainloop()
