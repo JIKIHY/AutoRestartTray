@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-자동 재시작 트레이 프로그램 (Windows 포터블)
+자동 종료/재시작 트레이 프로그램 (Windows 포터블)
 
 기능
-  - 24시간 내 '매일 지정 시각' 또는 '카운트다운'으로 PC 자동 재시작
-  - 예약 시각이 되면 열린 프로그램을 모두 무시하고 '강제로' 즉시 재시작 (경고 팝업 없음)
+  - 요일별로 원하는 시각에 PC 자동 '종료' 또는 '재시작' (요일마다 따로 설정)
+  - 예약 시각이 되면 열린 프로그램을 모두 무시하고 '강제로' 즉시 실행 (경고 팝업 없음)
   - 창의 ✕(닫기)를 눌러도 종료되지 않고 트레이로 최소화되어 계속 동작
-  - 부팅 시 자동 실행되어 트레이에 상주
+  - 부팅 시 자동 실행되어 트레이에 상주 → 설정은 매주 그대로 유지·반복
 
 관리자 권한 불필요. 설정은 실행 파일과 같은 폴더의 config.json 에 저장됩니다.
 """
 
 import os
 import sys
+import copy
 import json
 import time
 import threading
@@ -38,9 +39,13 @@ except ImportError:
 
 
 APP_NAME = "AutoRestartTray"          # 레지스트리/뮤텍스 식별자
-APP_TITLE = "자동 재시작"
+APP_TITLE = "자동 종료/재시작"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CREATE_NO_WINDOW = 0x08000000          # 콘솔 창 깜빡임 방지
+
+# 요일 (datetime.weekday(): 월=0 ... 일=6)
+WD_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+WD_LABELS = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 # ----------------------------------------------------------------------------
@@ -55,23 +60,31 @@ def app_dir():
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
 
+
+def default_schedule():
+    return {k: {"on": False, "hour": 18, "minute": 0, "action": "shutdown"}
+            for k in WD_KEYS}
+
+
 DEFAULT_CONFIG = {
-    "mode": "daily",        # 'daily'(매일 지정 시각) | 'countdown'(카운트다운)
-    "hour": 4,
-    "minute": 0,
-    "cd_hours": 3,
-    "cd_minutes": 0,
-    "cd_target_ts": None,   # 카운트다운 목표 절대시각(epoch)
+    "schedule": default_schedule(),   # 요일별 {on, hour, minute, action}
     "enabled": False,
     "autostart": True,
 }
 
 
 def load_config():
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            data = json.load(f)
+        for k, v in data.items():
+            if k == "schedule" and isinstance(v, dict):
+                for dk, dv in v.items():
+                    if dk in cfg["schedule"] and isinstance(dv, dict):
+                        cfg["schedule"][dk].update(dv)
+            else:
+                cfg[k] = v
     except Exception:
         pass
     return cfg
@@ -116,7 +129,7 @@ def set_autostart(enable):
 
 
 # ----------------------------------------------------------------------------
-# 트레이 아이콘 이미지 (전원/재시작 심볼)
+# 트레이 아이콘 이미지 (전원 심볼)
 # ----------------------------------------------------------------------------
 def make_icon(active):
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -135,19 +148,20 @@ class App:
     def __init__(self):
         self.cfg = load_config()
 
-        # 내부 상태 (스레드 간 공유되는 평범한 속성)
-        self.next_restart = None          # 다음 재시작 시각(datetime) 또는 None
-        self.start_time = time.time()     # 부팅 직후 우발적 재시작 방지용
+        # 내부 상태
+        self.next_dt = None               # 다음 실행 시각(datetime) 또는 None
+        self.next_action = None           # 'shutdown' | 'restart'
+        self.start_time = time.time()     # 부팅 직후 우발적 실행 방지용
         self.sched_running = True
         self._last_enabled = None
-        self._show_request = False        # 트레이 → 창 열기 요청
-        self._quit_request = False        # 트레이 → 종료 요청
-        self._notified_tray = False       # 트레이 안내 알림 1회용
+        self._show_request = False
+        self._quit_request = False
+        self._notified_tray = False
 
         # GUI
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("380x430")
+        self.root.geometry("400x560")
         self.root.resizable(False, False)
         self._build_gui()
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)  # ✕ → 트레이로
@@ -163,7 +177,6 @@ class App:
         set_autostart(self.cfg["autostart"])
         self._recompute_next()
 
-        # --tray 로 시작되면 창을 숨긴 채 트레이로만
         if "--tray" in sys.argv:
             self.root.withdraw()
 
@@ -171,55 +184,52 @@ class App:
 
     # --- GUI 구성 ---------------------------------------------------------
     def _build_gui(self):
-        self.mode_var = tk.StringVar(value=self.cfg["mode"])
-        self.hour_var = tk.StringVar(value=f'{int(self.cfg["hour"]):02d}')
-        self.min_var = tk.StringVar(value=f'{int(self.cfg["minute"]):02d}')
-        self.cdh_var = tk.StringVar(value=str(int(self.cfg["cd_hours"])))
-        self.cdm_var = tk.StringVar(value=str(int(self.cfg["cd_minutes"])))
         self.autostart_var = tk.BooleanVar(value=self.cfg["autostart"])
         self.status_var = tk.StringVar(value="")
+        self.row_vars = {}   # key -> (on_var, hour_var, min_var, act_var)
 
-        ttk.Label(self.root, text="🔄  자동 재시작",
-                  font=("Malgun Gothic", 14, "bold")).pack(pady=(12, 4))
+        ttk.Label(self.root, text="🔌  자동 종료/재시작",
+                  font=("Malgun Gothic", 14, "bold")).pack(pady=(10, 4))
 
-        # 재시작 시점
-        f1 = ttk.LabelFrame(self.root, text="재시작 시점")
-        f1.pack(fill="x", padx=12, pady=6)
+        # 요일별 예약
+        sf = ttk.LabelFrame(self.root, text="요일별 예약  (체크한 요일 · 시각 · 동작)")
+        sf.pack(fill="x", padx=12, pady=6)
 
-        r1 = ttk.Frame(f1)
-        r1.pack(fill="x", padx=8, pady=4)
-        ttk.Radiobutton(r1, text="매일 지정 시각", value="daily",
-                        variable=self.mode_var).pack(side="left")
-        ttk.Spinbox(r1, from_=0, to=23, width=4, textvariable=self.hour_var,
-                    format="%02.0f", wrap=True).pack(side="left", padx=(8, 2))
-        ttk.Label(r1, text=":").pack(side="left")
-        ttk.Spinbox(r1, from_=0, to=59, width=4, textvariable=self.min_var,
-                    format="%02.0f", wrap=True).pack(side="left", padx=(2, 0))
+        for key, label in zip(WD_KEYS, WD_LABELS):
+            e = self.cfg["schedule"][key]
+            row = ttk.Frame(sf)
+            row.pack(fill="x", padx=8, pady=1)
 
-        r2 = ttk.Frame(f1)
-        r2.pack(fill="x", padx=8, pady=4)
-        ttk.Radiobutton(r2, text="카운트다운", value="countdown",
-                        variable=self.mode_var).pack(side="left")
-        ttk.Spinbox(r2, from_=0, to=24, width=4, textvariable=self.cdh_var,
-                    wrap=True).pack(side="left", padx=(8, 2))
-        ttk.Label(r2, text="시간").pack(side="left")
-        ttk.Spinbox(r2, from_=0, to=59, width=4, textvariable=self.cdm_var,
-                    wrap=True).pack(side="left", padx=(8, 2))
-        ttk.Label(r2, text="분 후").pack(side="left")
+            on_var = tk.BooleanVar(value=e["on"])
+            hour_var = tk.StringVar(value=f'{int(e["hour"]):02d}')
+            min_var = tk.StringVar(value=f'{int(e["minute"]):02d}')
+            act_var = tk.StringVar(
+                value="종료" if e.get("action", "shutdown") == "shutdown" else "재시작")
+
+            ttk.Checkbutton(row, text=label, variable=on_var, width=3).pack(side="left")
+            ttk.Spinbox(row, from_=0, to=23, width=3, textvariable=hour_var,
+                        format="%02.0f", wrap=True).pack(side="left", padx=(6, 1))
+            ttk.Label(row, text=":").pack(side="left")
+            ttk.Spinbox(row, from_=0, to=59, width=3, textvariable=min_var,
+                        format="%02.0f", wrap=True).pack(side="left", padx=(1, 8))
+            ttk.Combobox(row, values=["종료", "재시작"], textvariable=act_var,
+                         width=6, state="readonly").pack(side="left")
+
+            self.row_vars[key] = (on_var, hour_var, min_var, act_var)
 
         # 옵션
         f2 = ttk.LabelFrame(self.root, text="옵션")
         f2.pack(fill="x", padx=12, pady=6)
-        ttk.Checkbutton(f2, text="부팅 시 자동 실행 (트레이 상주)",
+        ttk.Checkbutton(f2, text="부팅 시 자동 실행 (트레이 상주 · 설정 유지)",
                         variable=self.autostart_var).pack(anchor="w", padx=8, pady=6)
 
         # 상태
         ttk.Label(self.root, textvariable=self.status_var, justify="left",
-                  font=("Malgun Gothic", 10)).pack(fill="x", padx=14, pady=(8, 4))
+                  font=("Malgun Gothic", 10)).pack(fill="x", padx=14, pady=(6, 4))
 
-        # 버튼 (활성화 체크 없이 '예약 시작' 한 번이면 동작)
+        # 버튼
         b = ttk.Frame(self.root)
-        b.pack(fill="x", padx=12, pady=(4, 4))
+        b.pack(fill="x", padx=12, pady=(2, 4))
         ttk.Button(b, text="예약 시작", command=self.apply_settings).pack(
             side="left", expand=True, fill="x", padx=2)
         ttk.Button(b, text="예약 중지", command=self.stop_schedule).pack(
@@ -229,8 +239,8 @@ class App:
 
         ttk.Label(self.root,
                   text="✕ 를 눌러도 트레이에서 계속 동작합니다.\n"
-                       "예약 시각이 되면 열린 프로그램을 모두 무시하고 강제 재시작합니다.",
-                  foreground="#888", justify="center").pack(pady=(2, 10))
+                       "예약 시각이 되면 열린 프로그램을 모두 무시하고 강제 실행합니다.",
+                  foreground="#888", justify="center").pack(pady=(2, 8))
 
     # --- 트레이 메뉴 ------------------------------------------------------
     def _build_menu(self):
@@ -246,104 +256,109 @@ class App:
         )
 
     def _status_line(self):
-        if self.cfg["enabled"] and self.next_restart:
-            return "다음: " + self.next_restart.strftime("%m/%d %H:%M")
+        if self.cfg["enabled"] and self.next_dt:
+            act = "종료" if self.next_action == "shutdown" else "재시작"
+            return "다음: " + self.next_dt.strftime("%m/%d %H:%M") + " " + act
         return "예약 없음"
 
-    # --- 다음 재시작 시각 계산 (tk 호출 없음 → 어느 스레드에서나 안전) -----
+    # --- 다음 실행 시각 계산 (tk 호출 없음 → 어느 스레드에서나 안전) -------
     def _recompute_next(self):
         if not self.cfg["enabled"]:
-            self.next_restart = None
+            self.next_dt = None
+            self.next_action = None
             return
-        if self.cfg["mode"] == "daily":
-            now = datetime.datetime.now()
-            t = now.replace(hour=int(self.cfg["hour"]), minute=int(self.cfg["minute"]),
-                            second=0, microsecond=0)
-            if t <= now:
-                t += datetime.timedelta(days=1)
-            self.next_restart = t
-        else:  # countdown
-            ts = self.cfg.get("cd_target_ts")
-            if ts and ts > time.time():
-                self.next_restart = datetime.datetime.fromtimestamp(ts)
-            else:
-                self.next_restart = None
-                self.cfg["enabled"] = False
+        now = datetime.datetime.now()
+        best = None
+        best_action = None
+        for i in range(0, 8):  # 오늘부터 7일 내 가장 가까운 예약
+            day = now + datetime.timedelta(days=i)
+            e = self.cfg["schedule"].get(WD_KEYS[day.weekday()])
+            if not e or not e.get("on"):
+                continue
+            dt = day.replace(hour=int(e["hour"]), minute=int(e["minute"]),
+                             second=0, microsecond=0)
+            if dt <= now:
+                continue
+            if best is None or dt < best:
+                best = dt
+                best_action = e.get("action", "shutdown")
+        self.next_dt = best
+        self.next_action = best_action
 
     # --- 스케줄러 스레드 ---------------------------------------------------
     def _scheduler(self):
+        last_fire = None
         while self.sched_running:
             try:
-                # 부팅 직후 90초는 보류 (재시작→부팅→즉시재시작 루프 방지)
-                if (self.cfg["enabled"] and self.next_restart
-                        and time.time() - self.start_time > 90
-                        and datetime.datetime.now() >= self.next_restart):
-                    self._do_restart()
+                if self.cfg["enabled"] and time.time() - self.start_time > 90:
+                    now = datetime.datetime.now()
+                    e = self.cfg["schedule"].get(WD_KEYS[now.weekday()])
+                    if (e and e.get("on")
+                            and now.hour == int(e["hour"])
+                            and now.minute == int(e["minute"])):
+                        fire_key = (now.year, now.month, now.day, now.hour, now.minute)
+                        if fire_key != last_fire:
+                            last_fire = fire_key
+                            self._do_action(e.get("action", "shutdown"))
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(10)
 
-    def _do_restart(self):
-        # 무조건 강제 즉시 재시작 — 열린 프로그램/저장 안 된 파일 전부 무시
+    def _do_action(self, action):
+        # 무조건 강제 즉시 실행 — 열린 프로그램/저장 안 된 파일 전부 무시
+        flag = "/s" if action == "shutdown" else "/r"
         try:
-            subprocess.run(["shutdown", "/r", "/t", "0", "/f"],
+            subprocess.run(["shutdown", flag, "/t", "0", "/f"],
                            creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
-        # 재부팅 전 중복 트리거 방지
-        if self.cfg["mode"] == "daily":
-            self.next_restart = self.next_restart + datetime.timedelta(days=1)
-        else:
-            self.cfg["enabled"] = False
-            self.cfg["cd_target_ts"] = None
-            self.next_restart = None
-            save_config(self.cfg)
 
     # --- 동작 (버튼/트레이 공용) ------------------------------------------
     def apply_settings(self):
+        sched = {}
         try:
-            self.cfg["mode"] = self.mode_var.get()
-            self.cfg["hour"] = max(0, min(23, int(self.hour_var.get())))
-            self.cfg["minute"] = max(0, min(59, int(self.min_var.get())))
-            self.cfg["cd_hours"] = max(0, min(24, int(self.cdh_var.get())))
-            self.cfg["cd_minutes"] = max(0, min(59, int(self.cdm_var.get())))
+            for key in WD_KEYS:
+                on_var, hour_var, min_var, act_var = self.row_vars[key]
+                sched[key] = {
+                    "on": bool(on_var.get()),
+                    "hour": max(0, min(23, int(hour_var.get()))),
+                    "minute": max(0, min(59, int(min_var.get()))),
+                    "action": "shutdown" if act_var.get() == "종료" else "restart",
+                }
         except ValueError:
-            messagebox.showerror(APP_TITLE, "숫자를 올바르게 입력하세요.")
+            messagebox.showerror(APP_TITLE, "시각을 올바르게 입력하세요.")
             return
 
-        # '예약 시작' = 곧바로 활성화 (활성화 체크 단계 없음)
+        if not any(sched[k]["on"] for k in WD_KEYS):
+            messagebox.showerror(APP_TITLE, "최소 한 개 요일을 체크하세요.")
+            return
+
+        self.cfg["schedule"] = sched
         self.cfg["enabled"] = True
-        self.cfg["autostart"] = self.autostart_var.get()
-        if self.cfg["mode"] == "daily":
-            # 매일 반복은 부팅 자동실행이 있어야 유지됨 → 자동 보장
-            self.cfg["autostart"] = True
-            self.autostart_var.set(True)
+        # 요일 예약은 매주 반복·부팅 유지가 필요 → 자동 실행 보장
+        self.cfg["autostart"] = True
+        self.autostart_var.set(True)
 
-        if self.cfg["mode"] == "countdown":
-            dur = self.cfg["cd_hours"] * 3600 + self.cfg["cd_minutes"] * 60
-            if dur <= 0:
-                self.cfg["enabled"] = False
-                messagebox.showerror(APP_TITLE, "카운트다운 시간을 설정하세요.")
-                return
-            self.cfg["cd_target_ts"] = time.time() + dur
-
-        set_autostart(self.cfg["autostart"])
+        set_autostart(True)
         save_config(self.cfg)
         self._recompute_next()
 
-        if self.cfg["mode"] == "daily":
-            msg = (f"매일 {self.cfg['hour']:02d}:{self.cfg['minute']:02d} 에 자동 재시작됩니다.\n"
-                   "재부팅 후에도 유지되며, 시각이 되면 강제로 재시작합니다.")
-        else:
-            msg = f"{self.cfg['cd_hours']}시간 {self.cfg['cd_minutes']}분 후 강제 재시작됩니다."
-        messagebox.showinfo(APP_TITLE, msg)
+        lines = []
+        for key, label in zip(WD_KEYS, WD_LABELS):
+            e = sched[key]
+            if e["on"]:
+                act = "종료" if e["action"] == "shutdown" else "재시작"
+                lines.append(f"  {label}요일  {e['hour']:02d}:{e['minute']:02d}  {act}")
+        messagebox.showinfo(
+            APP_TITLE,
+            "다음 예약이 시작되었습니다:\n\n" + "\n".join(lines) +
+            "\n\n재부팅 후에도 매주 그대로 유지됩니다.")
 
     def stop_schedule(self):
         self.cfg["enabled"] = False
-        self.cfg["cd_target_ts"] = None
         save_config(self.cfg)
         self._recompute_next()
-        messagebox.showinfo(APP_TITLE, "자동 재시작 예약을 중지했습니다.")
+        messagebox.showinfo(APP_TITLE, "예약을 중지했습니다.")
 
     # --- 트레이 콜백 (tk 직접 호출 금지 → 플래그/평범한 상태만 변경) -------
     def _tray_show(self, icon=None, item=None):
@@ -354,10 +369,6 @@ class App:
 
     def _tray_toggle(self, icon, item):
         self.cfg["enabled"] = not self.cfg["enabled"]
-        if self.cfg["enabled"] and self.cfg["mode"] == "countdown":
-            dur = int(self.cfg["cd_hours"]) * 3600 + int(self.cfg["cd_minutes"]) * 60
-            if dur > 0:
-                self.cfg["cd_target_ts"] = time.time() + dur
         self._recompute_next()
         save_config(self.cfg)
         try:
@@ -416,17 +427,16 @@ class App:
         self.root.after(1000, self._tick)
 
     def _refresh_status(self):
-        if self.cfg["enabled"] and self.next_restart:
-            remaining = int((self.next_restart - datetime.datetime.now()).total_seconds())
+        if self.cfg["enabled"] and self.next_dt:
+            remaining = int((self.next_dt - datetime.datetime.now()).total_seconds())
             remaining = max(0, remaining)
             h, m, s = remaining // 3600, (remaining % 3600) // 60, remaining % 60
-            if self.cfg["mode"] == "daily":
-                head = f"매일 {int(self.cfg['hour']):02d}:{int(self.cfg['minute']):02d} 자동 재시작 (반복)"
-            else:
-                head = "다음 재시작: " + self.next_restart.strftime("%m/%d %H:%M")
+            act = "종료" if self.next_action == "shutdown" else "재시작"
+            wd = WD_LABELS[self.next_dt.weekday()]
+            head = f"다음: {self.next_dt.strftime('%m/%d')}({wd}) {self.next_dt.strftime('%H:%M')} {act}"
             self.status_var.set(f"{head}\n남은 시간: {h:02d}:{m:02d}:{s:02d}")
         else:
-            self.status_var.set("예약 없음 — 시각을 정하고 '예약 시작'을 누르세요.")
+            self.status_var.set("예약 없음 — 요일/시각을 정하고 '예약 시작'을 누르세요.")
 
     def run(self):
         self.root.mainloop()
